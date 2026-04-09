@@ -596,12 +596,17 @@ class SafariBooks:
                 c["images"] = images
             chapters.append(c)
 
-        result = []
-        result.extend([c for c in chapters if "cover" in c.get("filename", "") or "cover" in c.get("title", "")])
-        for c in result:
+        cover_chapters = []
+        for c in chapters:
+            fn = c.get("filename", "").lower()
+            title = c.get("title", "").lower()
+            # Only match actual cover pages, not "about the cover" etc.
+            if fn.split("/")[-1].startswith("cover") or fn.split("/")[-1].startswith("titlepage") or title == "cover":
+                cover_chapters.append(c)
+        for c in cover_chapters:
             chapters.remove(c)
 
-        result += chapters
+        result = cover_chapters + chapters
         return result + (self.get_book_chapters(response["next"]) if response["next"] else [])
 
     def get_default_cover(self):
@@ -1003,6 +1008,12 @@ class SafariBooks:
         subjects = "\n".join("<dc:subject>{0}</dc:subject>".format(escape(sub.get("name", "n/d")))
                              for sub in self.book_info.get("subjects", []))
 
+        # Convert cover image path to manifest item ID
+        cover_id = self.cover
+        if self.cover and self.cover is not False:
+            cover_name = self.cover.split("/")[-1]
+            cover_id = "img_" + escape("".join(cover_name.split(".")[:-1]))
+
         return self.CONTENT_OPF.format(
             (self.book_info.get("isbn",  self.book_id)),
             escape(self.book_title),
@@ -1012,7 +1023,7 @@ class SafariBooks:
             ", ".join(escape(pub.get("name", "")) for pub in self.book_info.get("publishers", [])),
             escape(self.book_info.get("rights", "")),
             self.book_info.get("issued", "") or self.book_info.get("publication_date", ""),
-            self.cover,
+            cover_id if cover_id else "",
             "\n".join(manifest),
             "\n".join(spine),
             self.book_chapters[0]["filename"].replace(".html", ".xhtml")
