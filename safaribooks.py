@@ -140,7 +140,7 @@ class Display:
                      .format(*self.last_request))
 
     def intro(self):
-        output = self.SH_YELLOW + ("""
+        output = self.SH_YELLOW + (r"""
        ____     ___         _
       / __/__ _/ _/__ _____(_)
      _\ \/ _ `/ _/ _ `/ __/ /
@@ -172,14 +172,16 @@ class Display:
             return "n/d"
 
     def book_info(self, info):
-        description = self.parse_description(info.get("description", None)).replace("\n", " ")
+        raw_desc = info.get("description") or info.get("descriptions", {}).get("text/plain") or None
+        description = self.parse_description(raw_desc).replace("\n", " ")
         for t in [
-            ("Title", info.get("title", "")), ("Authors", ", ".join(aut.get("name", "") for aut in info.get("authors", []))),
+            ("Title", info.get("title", "")),
+            ("Authors", ", ".join(aut.get("name", "") for aut in info.get("authors", []))),
             ("Identifier", info.get("identifier", "")), ("ISBN", info.get("isbn", "")),
             ("Publishers", ", ".join(pub.get("name", "") for pub in info.get("publishers", []))),
             ("Rights", info.get("rights", "")),
             ("Description", description[:500] + "..." if len(description) >= 500 else description),
-            ("Release Date", info.get("issued", "")),
+            ("Release Date", info.get("issued", "") or info.get("publication_date", "")),
             ("URL", info.get("web_url", ""))
         ]:
             self.info("{0}{1}{2}: {3}".format(self.SH_YELLOW, t[0], self.SH_DEFAULT, t[1]), True)
@@ -234,7 +236,7 @@ class SafariBooks:
     API_LOGIN_URL = API_ORIGIN_URL + "/api/v1/auth/login/"
     API_LOGIN_LOOKUP_URL = API_ORIGIN_URL + "/api/m/v2/auth/lookup/"
 
-    API_TEMPLATE = SAFARI_BASE_URL + "/api/v1/book/{0}/"
+    API_TEMPLATE = SAFARI_BASE_URL + "/api/v2/epubs/urn:orm:book:{0}/"
 
     BASE_01_HTML = "<!DOCTYPE html>\n" \
                    "<html lang=\"en\" xml:lang=\"en\" xmlns=\"http://www.w3.org/1999/xhtml\"" \
@@ -360,7 +362,10 @@ class SafariBooks:
             sys.setrecursionlimit(len(self.book_chapters))
 
         self.book_title = self.book_info["title"]
-        self.base_url = self.book_info["web_url"]
+        self.base_url = self.book_info.get(
+            "web_url",
+            SAFARI_BASE_URL + "/library/view/-/" + self.book_id + "/"
+        )
 
         self.clean_book_title = "".join(self.escape_dirname(self.book_title).split(",")[:2]) \
                                 + " ({0})".format(self.book_id)
@@ -516,7 +521,19 @@ class SafariBooks:
         if response == 0:
             self.display.exit("API: unable to retrieve book info.")
 
-        response = response.json()
+        if response.status_code != 200:
+            self.display.exit(
+                "API: unable to retrieve book info (HTTP %d). "
+                "The book ID '%s' may be invalid or not available." % (response.status_code, self.book_id)
+            )
+
+        try:
+            response = response.json()
+        except ValueError:
+            self.display.exit(
+                "API: unexpected response format for book '%s'. "
+                "The API may have changed or the book ID is invalid." % self.book_id
+            )
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
 
@@ -529,12 +546,25 @@ class SafariBooks:
 
         return response
 
-    def get_book_chapters(self, page=1):
-        response = self.requests_provider(urljoin(self.api_url, "chapter/?page=%s" % page))
+    def get_book_chapters(self, url=None):
+        if url is None:
+            url = self.book_info.get("chapters")
+            if not url:
+                url = urljoin(self.api_url, "chapter/")
+
+        response = self.requests_provider(url)
         if response == 0:
             self.display.exit("API: unable to retrieve book chapters.")
 
-        response = response.json()
+        if response.status_code != 200:
+            self.display.exit(
+                "API: unable to retrieve book chapters (HTTP %d)." % response.status_code
+            )
+
+        try:
+            response = response.json()
+        except ValueError:
+            self.display.exit("API: unexpected response format when retrieving book chapters.")
 
         if not isinstance(response, dict) or len(response.keys()) == 1:
             self.display.exit(self.display.api_error(response))
@@ -545,13 +575,32 @@ class SafariBooks:
         if response["count"] > sys.getrecursionlimit():
             sys.setrecursionlimit(response["count"])
 
-        result = []
-        result.extend([c for c in response["results"] if "cover" in c["filename"] or "cover" in c["title"]])
-        for c in result:
-            del response["results"][response["results"].index(c)]
+        chapters = []
+        for c in response["results"]:
+            if "filename" not in c and "content_url" in c:
+                content_url = c["content_url"]
+                filename = content_url.rsplit("/files/", 1)[-1] if "/files/" in content_url else content_url.split("/")[-1]
+                asset_base_url = content_url.rsplit("/files/", 1)[0] + "/files" if "/files/" in content_url else content_url.rsplit("/", 1)[0]
+                images = []
+                if "related_assets" in c:
+                    for img_url in c["related_assets"].get("images", []):
+                        if "/files/" in img_url:
+                            images.append(img_url.rsplit("/files/", 1)[-1])
+                        else:
+                            images.append(img_url)
+                c["filename"] = filename
+                c["content"] = content_url
+                c["asset_base_url"] = asset_base_url
+                c["images"] = images
+            chapters.append(c)
 
-        result += response["results"]
-        return result + (self.get_book_chapters(page + 1) if response["next"] else [])
+        result = []
+        result.extend([c for c in chapters if "cover" in c.get("filename", "") or "cover" in c.get("title", "")])
+        for c in result:
+            chapters.remove(c)
+
+        result += chapters
+        return result + (self.get_book_chapters(response["next"]) if response["next"] else [])
 
     def get_default_cover(self):
         response = self.requests_provider(self.book_info["cover"], stream=True)
@@ -777,7 +826,9 @@ class SafariBooks:
 
     def save_page_html(self, contents):
         self.filename = self.filename.replace(".html", ".xhtml")
-        open(os.path.join(self.BOOK_PATH, "OEBPS", self.filename), "wb") \
+        filepath = os.path.join(self.BOOK_PATH, "OEBPS", self.filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        open(filepath, "wb") \
             .write(self.BASE_HTML.format(contents[0], contents[1]).encode("utf-8", 'xmlcharrefreplace'))
         self.display.log("Created: %s" % self.filename)
 
@@ -921,7 +972,7 @@ class SafariBooks:
         spine = []
         for c in self.book_chapters:
             c["filename"] = c["filename"].replace(".html", ".xhtml")
-            item_id = escape("".join(c["filename"].split(".")[:-1]))
+            item_id = escape("".join(c["filename"].split(".")[:-1]).replace("/", "_"))
             manifest.append("<item id=\"{0}\" href=\"{1}\" media-type=\"application/xhtml+xml\" />".format(
                 item_id, c["filename"]
             ))
@@ -950,11 +1001,11 @@ class SafariBooks:
             (self.book_info.get("isbn",  self.book_id)),
             escape(self.book_title),
             authors,
-            escape(self.book_info.get("description", "")),
+            escape(self.book_info.get("description", "") or self.book_info.get("descriptions", {}).get("text/plain", "")),
             subjects,
             ", ".join(escape(pub.get("name", "")) for pub in self.book_info.get("publishers", [])),
             escape(self.book_info.get("rights", "")),
-            self.book_info.get("issued", ""),
+            self.book_info.get("issued", "") or self.book_info.get("publication_date", ""),
             self.cover,
             "\n".join(manifest),
             "\n".join(spine),
@@ -969,11 +1020,20 @@ class SafariBooks:
             if int(cc["depth"]) > mx:
                 mx = int(cc["depth"])
 
+            nav_id = cc.get("fragment") or cc.get("id") or cc.get("reference_id", "nav_%d" % c)
+            label = escape(cc.get("label") or cc.get("title", ""))
+            href = cc.get("href", "")
+            if not href and "reference_id" in cc:
+                ref = cc["reference_id"]
+                href = ref.split("-", 1)[-1] if "-" in ref else ref
+                if href.startswith("/"):
+                    href = href[1:]
+            href = href.replace(".html", ".xhtml")
+
             r += "<navPoint id=\"{0}\" playOrder=\"{1}\">" \
                  "<navLabel><text>{2}</text></navLabel>" \
                  "<content src=\"{3}\"/>".format(
-                    cc["fragment"] if len(cc["fragment"]) else cc["id"], c,
-                    escape(cc["label"]), cc["href"].replace(".html", ".xhtml").split("/")[-1]
+                    nav_id, c, label, href
                  )
 
             if cc["children"]:
@@ -985,13 +1045,22 @@ class SafariBooks:
         return r, c, mx
 
     def create_toc(self):
-        response = self.requests_provider(urljoin(self.api_url, "toc/"))
+        toc_url = self.book_info.get("table_of_contents", urljoin(self.api_url, "toc/"))
+        response = self.requests_provider(toc_url)
         if response == 0:
-            self.display.exit("API: unable to retrieve book chapters. "
+            self.display.exit("API: unable to retrieve book TOC. "
                               "Don't delete any files, just run again this program"
                               " in order to complete the `.epub` creation!")
 
-        response = response.json()
+        if response.status_code != 200:
+            self.display.exit("API: unable to retrieve TOC (HTTP %d)." % response.status_code)
+
+        try:
+            response = response.json()
+        except ValueError:
+            self.display.log("TOC URL: %s" % toc_url)
+            self.display.log("TOC response (first 500 chars): %s" % response.text[:500])
+            self.display.exit("API: TOC response is not valid JSON. The TOC API format may have changed.")
 
         if not isinstance(response, list) and len(response.keys()) == 1:
             self.display.exit(
