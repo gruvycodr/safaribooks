@@ -393,6 +393,8 @@ class SafariBooks:
         self.get()
         if not self.cover:
             self.cover = self.get_default_cover() if "cover" in self.book_info else False
+
+        if self.cover:
             cover_html = self.parse_html(
                 html.fromstring("<div id=\"sbo-rt-content\"><img src=\"Images/{0}\"></div>".format(self.cover)), True
             )
@@ -650,6 +652,9 @@ class SafariBooks:
                 if any(x in link for x in ["cover", "images", "graphics"]) or \
                         self.is_image_link(link):
                     image = link.split("/")[-1]
+                    # If chapter is in a subdirectory (e.g. Text/), use relative path
+                    if "/" in self.filename:
+                        return "../Images/" + image
                     return "Images/" + image
 
                 return link.replace(".html", ".xhtml")
@@ -702,8 +707,9 @@ class SafariBooks:
                     self.css.append(chapter_css_url)
                     self.display.log("Crawler: found a new CSS at %s" % chapter_css_url)
 
-                page_css += "<link href=\"Styles/Style{0:0>2}.css\" " \
-                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(self.css.index(chapter_css_url))
+                styles_prefix = "../Styles" if "/" in self.filename else "Styles"
+                page_css += "<link href=\"{0}/Style{1:0>2}.css\" " \
+                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(styles_prefix, self.css.index(chapter_css_url))
 
         stylesheet_links = root.xpath("//link[@rel='stylesheet']")
         if len(stylesheet_links):
