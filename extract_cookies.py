@@ -30,6 +30,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 OREILLY_DOMAINS = [".oreilly.com", "learning.oreilly.com", "api.oreilly.com"]
 
+# Akamai bot-detection cookies are session-bound and break when reused
+SKIP_COOKIES = {"_abck", "ak_bmsc", "bm_sz", "bm_sv", "bm_s", "bm_so", "bm_ss", "bm_lso"}
+
 BROWSER_COOKIE_DBS = {
     "brave": os.path.expanduser(
         "~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies"
@@ -60,19 +63,20 @@ def get_browser_key(browser):
     return result.stdout.strip()
 
 
-def derive_key(chrome_password):
-    """Derive the AES key from Chrome's password using PBKDF2."""
+def derive_key(browser_password, browser="chrome"):
+    """Derive the AES key from the browser's password using PBKDF2."""
+    iterations = 1003 if browser == "chrome" else 1003
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA1(),
         length=16,
         salt=b"saltysalt",
-        iterations=1003,
+        iterations=iterations,
     )
-    return kdf.derive(chrome_password.encode("utf-8"))
+    return kdf.derive(browser_password.encode("utf-8"))
 
 
 def decrypt_cookie(encrypted_value, key):
-    """Decrypt a Chrome cookie value."""
+    """Decrypt a Chrome/Brave cookie value."""
     if not encrypted_value:
         return ""
 
@@ -85,17 +89,19 @@ def decrypt_cookie(encrypted_value, key):
         decrypted = decryptor.update(encrypted_value) + decryptor.finalize()
         # Remove PKCS7 padding
         padding_len = decrypted[-1]
-        if isinstance(padding_len, int):
+        if isinstance(padding_len, int) and 0 < padding_len <= 16:
             decrypted = decrypted[:-padding_len]
-        return decrypted.decode("utf-8", errors="replace")
-
-    # v20 uses a different encryption (Chrome 80+), not commonly seen on macOS
-    if encrypted_value[:3] == b"v20":
-        print("Warning: v20 encrypted cookie found. This is not yet supported.")
-        return ""
+        # Brave prepends a 32-byte signature before the actual value.
+        # Strip it by finding the \x02 separator.
+        if b"\x02" in decrypted[:33]:
+            decrypted = decrypted[decrypted.index(b"\x02") + 1:]
+        elif b"~" in decrypted[:33]:
+            # Akamai LB cookies: value starts at first ~
+            decrypted = decrypted[decrypted.index(b"~"):]
+        return decrypted.decode("ascii", errors="ignore")
 
     # Unencrypted
-    return encrypted_value.decode("utf-8", errors="replace")
+    return encrypted_value.decode("utf-8", errors="ignore")
 
 
 def detect_browser():
@@ -140,6 +146,8 @@ def extract_cookies(browser=None):
                 ("%" + domain,)
             )
             for name, encrypted_value, value in cursor.fetchall():
+                if name in SKIP_COOKIES:
+                    continue
                 if value:
                     cookies[name] = value
                 elif encrypted_value:
